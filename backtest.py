@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
@@ -103,98 +104,154 @@ def _universe_from_pykrx(n: int) -> pd.DataFrame:
     return out
 
 
-def _fetch_yahoo_screeners_candidates(count: int = 500) -> pd.DataFrame:
+def _universe_from_naver(n: int) -> pd.DataFrame:
     """
-    GitHub-Actions-safe fallback universe source.
+    Fallback source for GitHub Actions:
+    Naver Finance KOSPI market-cap ranking pages.
 
-    Yahoo's screener endpoint is queried for Korea equities and sorted by
-    market cap. We then keep '.KS' symbols (KOSPI) and validate candidates
-    with yfinance price history later.
+    Naver Finance exposes KOSPI market-cap rankings with roughly 50 stocks
+    per page. We scrape enough pages to cover n names, extract the 6-digit
+    ticker from the stock detail link, and preserve the displayed ranking.
 
-    This fallback exists because KRX may reject/alter responses for cloud IPs,
-    causing pykrx JSONDecodeError ("Expecting value: line 1 column 1").
+    This avoids Yahoo Screener authentication (401) and does not depend on
+    KRX JSON endpoints that may fail from overseas/cloud IPs.
     """
     import requests
+    from bs4 import BeautifulSoup
 
-    url = "https://query1.finance.yahoo.com/v1/finance/screener"
-    payload = {
-        "size": min(max(count, 250), 250),
-        "offset": 0,
-        "sortField": "intradaymarketcap",
-        "sortType": "DESC",
-        "quoteType": "EQUITY",
-        "query": {
-            "operator": "AND",
-            "operands": [
-                {"operator": "eq", "operands": ["region", "kr"]},
-                {"operator": "eq", "operands": ["quoteType", "EQUITY"]},
-            ],
-        },
-        "userId": "",
-        "userIdType": "guid",
-    }
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/123.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        "Referer": "https://finance.naver.com/",
+        "Connection": "keep-alive",
     }
 
-    r = requests.post(url, json=payload, headers=headers, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
-
+    # Page normally contains 50 ranked securities.
+    pages = max(4, math.ceil(n / 50) + 1)
     rows = []
-    for q in quotes:
-        symbol = str(q.get("symbol", ""))
-        # Yahoo Korea suffix: .KS = KOSPI, .KQ = KOSDAQ
-        if not symbol.endswith(".KS"):
-            continue
-        code = symbol[:-3]
-        if not (len(code) == 6 and code.isdigit()):
-            continue
-        mcap = q.get("marketCap") or q.get("intradaymarketcap") or 0
-        rows.append(
-            {
-                "ticker": code,
-                "name": q.get("shortName") or q.get("longName") or code,
-                "market_cap": float(mcap or 0),
-                "asof": datetime.now().strftime("%Y%m%d"),
-                "universe_source": "yahoo_screener_fallback",
-                "yf_ticker": symbol,
-            }
+    seen = set()
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    for page in range(1, pages + 1):
+        url = (
+            "https://finance.naver.com/sise/"
+            f"sise_market_sum.naver?sosok=0&page={page}"
         )
+        try:
+            r = session.get(url, timeout=30)
+            r.raise_for_status()
+
+            # Naver Finance pages are commonly EUC-KR/CP949.
+            r.encoding = r.apparent_encoding or "euc-kr"
+            soup = BeautifulSoup(r.text, "html.parser")
+
+            table = soup.select_one("table.type_2")
+            if table is None:
+                print(f"[warn] Naver page {page}: market-cap table not found")
+                continue
+
+            page_count = 0
+            for tr in table.select("tr"):
+                a = tr.select_one('a.tltle[href*="code="]')
+                if a is None:
+                    continue
+
+                href = a.get("href", "")
+                m = re.search(r"code=(\d{6})", href)
+                if not m:
+                    continue
+
+                ticker = m.group(1)
+                if ticker in seen:
+                    continue
+
+                tds = tr.find_all("td")
+                # Naver market-cap table order commonly:
+                # N, name, current, change, %, par, mcap, shares, ...
+                market_cap = np.nan
+                try:
+                    # Find numeric cells and use the market-cap column by CSS-independent
+                    # position: after name, current, diff, rate, par.
+                    # Because columns can change, market cap is informational only;
+                    # ranking comes from Naver's displayed order.
+                    numeric_texts = [
+                        td.get_text(" ", strip=True).replace(",", "")
+                        for td in tds
+                    ]
+                    if len(numeric_texts) >= 7:
+                        mc_txt = numeric_texts[6].replace("조", "").replace("억", "")
+                        market_cap = float(re.sub(r"[^0-9.\-]", "", mc_txt) or "nan")
+                except Exception:
+                    market_cap = np.nan
+
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "name": a.get_text(strip=True),
+                        "market_cap": market_cap,
+                        "asof": datetime.now().strftime("%Y%m%d"),
+                        "universe_source": "naver_finance_market_cap",
+                        "yf_ticker": ticker + ".KS",
+                    }
+                )
+                seen.add(ticker)
+                page_count += 1
+
+            print(f"[universe] Naver page {page}: {page_count} symbols")
+
+            if len(rows) >= n:
+                break
+
+            time.sleep(0.35)
+
+        except Exception as e:
+            print(f"[warn] Naver page {page} failed: {type(e).__name__}: {e}")
 
     out = pd.DataFrame(rows)
     if out.empty:
-        raise RuntimeError("Yahoo screener fallback returned no .KS equities.")
-    return out.sort_values("market_cap", ascending=False).drop_duplicates("ticker")
+        raise RuntimeError("Naver Finance fallback returned no KOSPI symbols.")
+
+    # The page itself is already market-cap-ranked. Preserve page/row order.
+    out = out.drop_duplicates("ticker", keep="first").reset_index(drop=True)
+
+    if len(out) < n:
+        raise RuntimeError(
+            f"Naver Finance returned only {len(out)} KOSPI symbols; expected at least {n}."
+        )
+
+    return out.head(n).reset_index(drop=True)
 
 
 def current_kospi_top_n(n: int) -> pd.DataFrame:
     """
     Current KOSPI market-cap top N.
 
-    Primary: pykrx/KRX.
-    Fallback: Yahoo Finance Korea screener, filtered to '.KS' symbols.
+    Source priority:
+      1) pykrx/KRX
+      2) Naver Finance KOSPI market-cap ranking
 
-    Survivorship bias is intentionally accepted.
+    Survivorship bias is intentionally NOT corrected.
     """
     try:
         print("[universe] trying pykrx/KRX...")
         out = _universe_from_pykrx(n)
-        if len(out) >= min(n, 100):
+        if len(out) >= n:
             print(f"[universe] pykrx succeeded: {len(out)} symbols")
             return out.head(n).reset_index(drop=True)
         raise RuntimeError(f"pykrx returned only {len(out)} symbols")
     except Exception as e:
         print(f"[warn] pykrx universe failed: {type(e).__name__}: {e}")
-        print("[universe] falling back to Yahoo Finance screener...")
+        print("[universe] falling back to Naver Finance market-cap pages...")
 
-    # Yahoo endpoint often caps one request at 250, which is enough for top 200.
-    out = _fetch_yahoo_screeners_candidates(count=max(n + 30, 250))
-    if len(out) < n:
-        print(f"[warn] Yahoo fallback returned only {len(out)} KOSPI candidates.")
+    out = _universe_from_naver(n)
+    print(f"[universe] Naver succeeded: {len(out)} symbols")
     return out.head(n).reset_index(drop=True)
 
 

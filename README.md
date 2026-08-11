@@ -160,3 +160,18 @@ GitHub Actions의 해외/클라우드 IP에서 KRX가 정상 JSON 대신 빈 응
 
 따라서 KRX 접속 실패만으로 전체 백테스트가 종료되지 않습니다.
 `results/universe_current_top200.csv`의 `universe_source` 열에서 실제 사용된 소스를 확인할 수 있습니다.
+
+
+## v3: Yahoo 401 오류 수정
+
+이 버전에서는 Yahoo Finance Screener fallback을 제거했습니다.
+
+GitHub Actions에서:
+- KRX/pykrx가 정상 작동하면 KRX 시가총액 데이터를 사용
+- KRX가 JSON 오류로 실패하면 네이버 금융 `KOSPI 시가총액` 페이지를 읽어 상위 200종목을 구성
+
+네이버 금융은 시가총액 순으로 종목을 페이지별 표시하므로 첫 페이지부터 필요한 개수만큼 순서대로
+수집합니다. `results/universe_current_top200.csv`의 `universe_source`가
+`naver_finance_market_cap`이면 fallback이 사용된 것입니다.
+
+이 방식은 Yahoo Screener의 401 인증 오류를 사용하지 않습니다.
