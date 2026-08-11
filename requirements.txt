@@ -2,3 +2,4 @@ numpy>=1.26,<3
 pandas>=2.2,<4
 yfinance>=0.2.65,<1
 pykrx>=1.0.48,<2
+requests>=2.31,<3

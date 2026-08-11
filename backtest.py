@@ -49,52 +49,153 @@ class Config:
 
 
 def latest_krx_business_day(max_lookback: int = 14) -> str:
-    """Find a recent date for which KRX returns KOSPI market-cap data."""
+    """
+    Find a recent KRX business day.
+
+    NOTE:
+    pykrx can intermittently fail on GitHub Actions / overseas cloud IPs
+    because KRX endpoints may return non-JSON/blocked responses. Therefore
+    this helper is only used as the FIRST universe source and failure is
+    allowed; current_kospi_top_n() has a Yahoo fallback.
+    """
     today = datetime.now()
+    last_error = None
     for i in range(max_lookback):
         d = (today - timedelta(days=i)).strftime("%Y%m%d")
         try:
             cap = stock.get_market_cap_by_ticker(d, market="KOSPI")
             if cap is not None and not cap.empty:
                 return d
-        except Exception:
-            pass
-    raise RuntimeError("Could not find a recent KRX business day.")
+        except Exception as e:
+            last_error = e
+            continue
+    raise RuntimeError(
+        "Could not query a recent KRX business day via pykrx. "
+        f"Last error: {last_error}"
+    )
 
 
-def current_kospi_top_n(n: int) -> pd.DataFrame:
-    """
-    Current KOSPI market-cap top N.
-    Survivorship bias is intentionally accepted.
-    """
+def _universe_from_pykrx(n: int) -> pd.DataFrame:
+    """Primary source: KRX/pykrx market-cap table."""
     asof = latest_krx_business_day()
     cap = stock.get_market_cap_by_ticker(asof, market="KOSPI").copy()
-    if cap.empty:
-        raise RuntimeError("KRX market-cap query returned no data.")
-
-    # pykrx commonly exposes '시가총액'.
-    if "시가총액" not in cap.columns:
-        raise RuntimeError(f"Unexpected pykrx columns: {list(cap.columns)}")
+    if cap.empty or "시가총액" not in cap.columns:
+        raise RuntimeError("pykrx returned an empty/unexpected market-cap table.")
 
     cap = cap.sort_values("시가총액", ascending=False)
     rows = []
-    for ticker, row in cap.iterrows():
+    for ticker, row in cap.head(max(n + 30, n)).iterrows():
         try:
             name = stock.get_market_ticker_name(ticker)
         except Exception:
-            name = ticker
+            name = str(ticker)
         rows.append(
             {
                 "ticker": str(ticker).zfill(6),
                 "name": name,
                 "market_cap": float(row["시가총액"]),
                 "asof": asof,
+                "universe_source": "pykrx",
             }
         )
-
     out = pd.DataFrame(rows).head(n).reset_index(drop=True)
     out["yf_ticker"] = out["ticker"] + ".KS"
     return out
+
+
+def _fetch_yahoo_screeners_candidates(count: int = 500) -> pd.DataFrame:
+    """
+    GitHub-Actions-safe fallback universe source.
+
+    Yahoo's screener endpoint is queried for Korea equities and sorted by
+    market cap. We then keep '.KS' symbols (KOSPI) and validate candidates
+    with yfinance price history later.
+
+    This fallback exists because KRX may reject/alter responses for cloud IPs,
+    causing pykrx JSONDecodeError ("Expecting value: line 1 column 1").
+    """
+    import requests
+
+    url = "https://query1.finance.yahoo.com/v1/finance/screener"
+    payload = {
+        "size": min(max(count, 250), 250),
+        "offset": 0,
+        "sortField": "intradaymarketcap",
+        "sortType": "DESC",
+        "quoteType": "EQUITY",
+        "query": {
+            "operator": "AND",
+            "operands": [
+                {"operator": "eq", "operands": ["region", "kr"]},
+                {"operator": "eq", "operands": ["quoteType", "EQUITY"]},
+            ],
+        },
+        "userId": "",
+        "userIdType": "guid",
+    }
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Content-Type": "application/json",
+    }
+
+    r = requests.post(url, json=payload, headers=headers, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    quotes = data.get("finance", {}).get("result", [{}])[0].get("quotes", [])
+
+    rows = []
+    for q in quotes:
+        symbol = str(q.get("symbol", ""))
+        # Yahoo Korea suffix: .KS = KOSPI, .KQ = KOSDAQ
+        if not symbol.endswith(".KS"):
+            continue
+        code = symbol[:-3]
+        if not (len(code) == 6 and code.isdigit()):
+            continue
+        mcap = q.get("marketCap") or q.get("intradaymarketcap") or 0
+        rows.append(
+            {
+                "ticker": code,
+                "name": q.get("shortName") or q.get("longName") or code,
+                "market_cap": float(mcap or 0),
+                "asof": datetime.now().strftime("%Y%m%d"),
+                "universe_source": "yahoo_screener_fallback",
+                "yf_ticker": symbol,
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        raise RuntimeError("Yahoo screener fallback returned no .KS equities.")
+    return out.sort_values("market_cap", ascending=False).drop_duplicates("ticker")
+
+
+def current_kospi_top_n(n: int) -> pd.DataFrame:
+    """
+    Current KOSPI market-cap top N.
+
+    Primary: pykrx/KRX.
+    Fallback: Yahoo Finance Korea screener, filtered to '.KS' symbols.
+
+    Survivorship bias is intentionally accepted.
+    """
+    try:
+        print("[universe] trying pykrx/KRX...")
+        out = _universe_from_pykrx(n)
+        if len(out) >= min(n, 100):
+            print(f"[universe] pykrx succeeded: {len(out)} symbols")
+            return out.head(n).reset_index(drop=True)
+        raise RuntimeError(f"pykrx returned only {len(out)} symbols")
+    except Exception as e:
+        print(f"[warn] pykrx universe failed: {type(e).__name__}: {e}")
+        print("[universe] falling back to Yahoo Finance screener...")
+
+    # Yahoo endpoint often caps one request at 250, which is enough for top 200.
+    out = _fetch_yahoo_screeners_candidates(count=max(n + 30, 250))
+    if len(out) < n:
+        print(f"[warn] Yahoo fallback returned only {len(out)} KOSPI candidates.")
+    return out.head(n).reset_index(drop=True)
 
 
 def download_ohlcv(tickers: List[str], start: str, end: str) -> Dict[str, pd.DataFrame]:

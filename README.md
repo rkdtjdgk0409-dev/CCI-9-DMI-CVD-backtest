@@ -146,3 +146,17 @@ CCI+DMI + CVD 포지션사이징
 - 가격/거래량 및 KOSPI benchmark: yfinance/Yahoo Finance
 
 Yahoo Finance 데이터는 연구/개인 분석용으로 사용하세요.
+
+
+## GitHub Actions에서 pykrx 오류가 날 때
+
+GitHub Actions의 해외/클라우드 IP에서 KRX가 정상 JSON 대신 빈 응답이나 차단 페이지를 반환하면
+`Expecting value: line 1 column 1 (char 0)` 오류가 발생할 수 있습니다.
+
+수정 버전은 유니버스를 아래 순서로 자동 조회합니다.
+
+1. `pykrx` / KRX 시가총액 데이터
+2. 실패 시 Yahoo Finance Korea screener에서 `.KS` 종목만 골라 시가총액 상위 종목 구성
+
+따라서 KRX 접속 실패만으로 전체 백테스트가 종료되지 않습니다.
+`results/universe_current_top200.csv`의 `universe_source` 열에서 실제 사용된 소스를 확인할 수 있습니다.
